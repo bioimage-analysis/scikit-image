@@ -8,7 +8,8 @@ from ..exposure import histogram
 from .._shared.utils import check_nD, warn
 from ..transform import integral_image
 from ..util import crop, dtype_limits
-from ..filters._multiotsu import _find_threshold_multiotsu
+from ..filters._multiotsu import (_get_multiotsu_thresh_indices_lut,
+                                  _get_multiotsu_thresh_indices)
 
 
 __all__ = ['try_all_threshold',
@@ -378,7 +379,7 @@ def threshold_isodata(image, nbins=256, return_all=False):
     nbins : int, optional
         Number of bins used to calculate histogram. This value is ignored for
         integer arrays.
-    return_all: bool, optional
+    return_all : bool, optional
         If False (default), return only the lowest threshold that satisfies
         the above equality. If True, return all valid thresholds.
 
@@ -658,7 +659,7 @@ def threshold_minimum(image, nbins=256, max_iter=10000):
     nbins : int, optional
         Number of bins used to calculate histogram. This value is ignored for
         integer arrays.
-    max_iter: int, optional
+    max_iter : int, optional
         Maximum number of iterations to smooth the histogram.
 
     Returns
@@ -929,7 +930,7 @@ def threshold_niblack(image, window_size=15, k=0.2):
 
     Parameters
     ----------
-    image: ndarray
+    image : ndarray
         Input image.
     window_size : int, or iterable of int, optional
         Window size specified as a single odd integer (3, 5, 7, …),
@@ -994,7 +995,7 @@ def threshold_sauvola(image, window_size=15, k=0.2, r=None):
 
     Parameters
     ----------
-    image: ndarray
+    image : ndarray
         Input image.
     window_size : int, or iterable of int, optional
         Window size specified as a single odd integer (3, 5, 7, …),
@@ -1085,7 +1086,11 @@ def apply_hysteresis_threshold(image, low, high):
 
 
 def threshold_multiotsu(image, classes=3, nbins=256):
-    r"""Generates multiple thresholds for an input image.
+    r"""Generate `classes`-1 threshold values to divide gray levels in `image`.
+
+    The threshold values are chosen to maximize the total sum of pairwise
+    variances between the thresholded graylevel classes. See Notes and [1]_
+    for more details.
 
     Parameters
     ----------
@@ -1100,26 +1105,31 @@ def threshold_multiotsu(image, classes=3, nbins=256):
 
     Returns
     -------
-    idx_thresh : array
+    thresh : array
         Array containing the threshold values for the desired classes.
+
+    Raises
+    ------
+    ValueError
+         If ``image`` contains less grayscale value then the desired
+         number of classes.
 
     Notes
     -----
-    The threshold values are chosen in a way that maximizes the variance
-    between the desired classes. Based on the Multi-Otsu approach by
-    Liao, Chen and Chung.
-
     This implementation relies on a Cython function whose complexity
-    if :math:`O\left(\frac{Ch^{C-1}}{(C-1)!}\right)`, where :math:`h`
+    is :math:`O\left(\frac{Ch^{C-1}}{(C-1)!}\right)`, where :math:`h`
     is the number of histogram bins and :math:`C` is the number of
     classes desired.
+
+    The input image must be grayscale.
 
     References
     ----------
     .. [1] Liao, P-S., Chen, T-S. and Chung, P-C., "A fast algorithm for
            multilevel thresholding", Journal of Information Science and
            Engineering 17 (5): 713-727, 2001. Available at:
-           <http://ftp.iis.sinica.edu.tw/JISE/2001/200109_01.pdf>
+           <https://ftp.iis.sinica.edu.tw/JISE/2001/200109_01.pdf>
+           :DOI:`10.6688/JISE.2001.17.5.1`
     .. [2] Tosa, Y., "Multi-Otsu Threshold", a java plugin for ImageJ.
            Available at:
            <http://imagej.net/plugins/download/Multi_OtsuThreshold.java>
@@ -1132,50 +1142,38 @@ def threshold_multiotsu(image, classes=3, nbins=256):
     >>> thresholds = threshold_multiotsu(image)
     >>> regions = np.digitize(image, bins=thresholds)
     >>> regions_colorized = label2rgb(regions)
+
     """
+
+    if len(image.shape) > 2 and image.shape[-1] in (3, 4):
+        msg = ("threshold_multiotsu is expected to work correctly only for "
+               "grayscale images; image shape {0} looks like an RGB image")
+        warn(msg.format(image.shape))
+
     # calculating the histogram and the probability of each gray level.
-    hist, bin_centers = histogram(image.ravel(),
+    prob, bin_centers = histogram(image.ravel(),
                                   nbins=nbins,
-                                  source_range='image')
-    prob = hist / image.size
-    # histogram ignores nbins for integer arrays.
-    nbins = len(bin_centers)
+                                  source_range='image',
+                                  normalize=True)
+    prob = prob.astype('float32')
 
-    # defining arrays to store the zeroth (momP, cumulative probability)
-    # and first (momS, mean) moments, and the variance between classes
-    # (var_btwcls).
-    momP, momS, var_btwcls = [np.zeros((nbins, nbins)) for n in range(3)]
+    nvalues = np.count_nonzero(prob)
+    if nvalues < classes:
+        msg = ("The input image has only {} different values. "
+               "It can not be thresholded in {} classes")
+        raise ValueError(msg.format(nvalues, classes))
+    elif nvalues == classes:
+        thresh_idx = np.where(prob > 0)[0][:-1]
+    else:
+        # Get threshold indices
+        try:
+            thresh_idx = _get_multiotsu_thresh_indices_lut(prob, classes - 1)
+        except MemoryError:
+            # Don't use LUT if the number of bins is too large (if the
+            # image is uint16 for example): in this case, the
+            # allocated memory is too large.
+            thresh_idx = _get_multiotsu_thresh_indices(prob, classes - 1)
 
-    # building the lookup tables.
-    # step 1: calculating the diagonal.
-    for u in range(1, nbins):
-        momP[u, u] = prob[u]
-        momS[u, u] = u * prob[u]
+    thresh = bin_centers[thresh_idx]
 
-    # step 2: calculating the first row.
-    for u in range(1, nbins-1):
-        momP[1, u+1] = momP[1, u] + prob[u+1]
-        momS[1, u+1] = momS[1, u] + (u+1)*prob[u+1]
-
-    # step 3: calculating the other rows recursively.
-    for u in range(2, nbins):
-        for v in range(u+1, nbins):
-            momP[u, v] = momP[1, v] - momP[1, u-1]
-            momS[u, v] = momS[1, v] - momS[1, u-1]
-
-    # step 4: calculating the between class variance.
-    for u in range(1, nbins):
-        for v in range(u+1, nbins):
-            if (momP[u, v] != 0):
-                var_btwcls[u, v] = momS[u, v]**2 / momP[u, v]
-            else:
-                var_btwcls[u, v] = 0
-
-    # finding max threshold candidates, depending on classes.
-    # number of thresholds is equal to number of classes - 1.
-    aux_thresh = _find_threshold_multiotsu(var_btwcls, classes, nbins)
-
-    # correcting threshold values.
-    idx_thresh = bin_centers[:-1][aux_thresh.astype('int')]
-
-    return idx_thresh
+    return thresh
